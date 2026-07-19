@@ -9,7 +9,7 @@ Pick a folder like:
 ...that contains:
     2026-07-04 12-30-17.mp4                (video)
     2026-07-04 12-30-17_mic_fixed.srt      (subtitles)
-    top10_markers.edl                      (timeline markers, exported from Resolve as
+    top50_markers.edl                      (timeline markers, exported from Resolve as
                                              a CMX3600 EDL: each marker is an edit event
                                              line followed by a "|C:.. |M:.. |D:.." line)
 
@@ -33,6 +33,8 @@ Requirements
 import os
 import re
 import sys
+import time
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -134,7 +136,7 @@ def find_required_files(folder):
     base_name = os.path.basename(os.path.normpath(folder))
     video_path = os.path.join(folder, base_name + ".mp4")
     srt_path = os.path.join(folder, base_name + "_mic_fixed.srt")
-    edl_path = os.path.join(folder, "top10_markers.edl")
+    edl_path = os.path.join(folder, "top50_markers.edl")
 
     missing = [p for p in (video_path, srt_path, edl_path) if not os.path.isfile(p)]
     if missing:
@@ -255,11 +257,31 @@ def main():
         print("-> Send these lines back so the parser regex can be adjusted.")
 
     markers = parse_edl_markers(edl_path, fps)
-    added = 0
+
+    # Two markers can't share the exact same frame -- Resolve silently
+    # rejects the second one. Rather than lose markers to that, nudge any
+    # collision forward by a frame (or more, if several stack up) until it
+    # lands on a free spot. This keeps every marker, just off by a frame or
+    # two when the source EDL had several highlights land in the same second.
+    used_frames = set()
+    nudged = 0
     for mk in markers:
-        rel_frame = mk["frame"] - start_frame
-        if rel_frame < 0:
-            rel_frame = mk["frame"]
+        rel = mk["frame"] - start_frame
+        rel = rel if rel >= 0 else mk["frame"]
+        original = rel
+        while rel in used_frames:
+            rel += 1
+        if rel != original:
+            nudged += 1
+        used_frames.add(rel)
+        mk["rel_frame"] = rel
+    if nudged:
+        print(f"{nudged} marker(s) shared a timecode with another marker; "
+              f"nudged forward by 1+ frame(s) so all of them survive.")
+
+    added = 0
+    for i, mk in enumerate(markers, start=1):
+        rel_frame = mk["rel_frame"]
         try:
             if timeline.AddMarker(rel_frame, mk["color"], mk["name"], "", mk["duration"]):
                 added += 1
@@ -267,6 +289,11 @@ def main():
                 print(f"AddMarker rejected: frame={rel_frame} color={mk['color']} name={mk['name']!r}")
         except Exception as e:
             print(f"AddMarker raised {e!r} for {mk}")
+            traceback.print_exc()
+
+        if i % 10 == 0:
+            print(f"  ...{i}/{len(markers)} markers processed")
+        time.sleep(0.08)  # pace the calls so we don't overrun Resolve's scripting bridge
 
     messagebox.showinfo(
         "Done",
@@ -283,4 +310,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log_path = os.path.join(os.path.expanduser("~"), "obs_vod_import_error.log")
+        with open(log_path, "w", encoding="utf-8") as fh:
+            fh.write(traceback.format_exc())
+        print(f"Script crashed. Full traceback written to: {log_path}")
+        traceback.print_exc()
